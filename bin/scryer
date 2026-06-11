@@ -1,0 +1,642 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$SOURCE_DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+SCRYER_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_FILE="$SCRYER_ROOT/config/harness.env"
+LOG_DIR="$SCRYER_ROOT/logs"
+RUN_DIR="$SCRYER_ROOT/run"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+else
+  echo "Missing config: $CONFIG_FILE" >&2
+  exit 1
+fi
+
+mkdir -p "$LOG_DIR" "$RUN_DIR"
+
+: "${SCRYER_RESERVED_PORT_START:=43200}"
+: "${SCRYER_RESERVED_PORT_END:=43299}"
+: "${SCRYER_PM_PORT:=43210}"
+: "${SCRYER_LOOM_PORT:=43211}"
+: "${SCRYER_PM_HOST:=127.0.0.1}"
+: "${SCRYER_LOOM_HOST:=127.0.0.1}"
+: "${SCRYER_PM_URL:=http://127.0.0.1:${SCRYER_PM_PORT}}"
+: "${SCRYER_LOOM_URL:=http://127.0.0.1:${SCRYER_LOOM_PORT}}"
+: "${SCRYER_COMMON_VOLUME_ROOT:=/Users/amanrai/Code/common-volume}"
+: "${SCRYER_PM_APP_DIR:=${SCRYER_COMMON_VOLUME_ROOT}/repos/pm-system-ui}"
+: "${SCRYER_LOOM_APP_DIR:=${SCRYER_COMMON_VOLUME_ROOT}/repos/loom}"
+: "${SCRYER_OPEN_BROWSER:=1}"
+: "${SCRYER_BROWSER:=chrome}"
+: "${SCRYER_NODE_BIN_DIR:=/Users/amanrai/.nvm/versions/node/v22.22.0/bin}"
+
+if [[ -d "$SCRYER_NODE_BIN_DIR" ]]; then
+  export PATH="$SCRYER_NODE_BIN_DIR:$PATH"
+fi
+
+PM_PID_FILE="$RUN_DIR/pm-system.pid"
+LOOM_PID_FILE="$RUN_DIR/loom.pid"
+PM_LOG="$LOG_DIR/pm-system.log"
+LOOM_LOG="$LOG_DIR/loom.log"
+
+usage() {
+  cat <<USAGE
+Usage: scryer <command>
+
+Commands:
+  up            Start PM backend and Loom UI
+  open          Start PM/Loom if needed, then open Loom in the browser
+  restart       Stop, then start PM backend and Loom UI
+  down          Stop harness-owned PM/Loom processes
+  status        Show service status and reserved-port listeners
+  orphans       Report stale pid files and unexpected reserved-port listeners
+  kill-orphans  Kill unexpected reserved-port listeners and clean stale pid files
+  logs [name]   Tail logs. name: pm, loom, all (default: all)
+  ports         Show permanent Scryer port allocations
+  doctor        Check harness paths, dependencies, ports, and health
+
+Options:
+  scryer up --no-open       Start without opening the browser
+  scryer open --chrome      Open in Google Chrome (default)
+  scryer open --safari      Open in Safari
+  scryer open --cmux        Open in a cmux browser pane
+  scryer open --default     Open in the system default browser
+USAGE
+}
+
+pid_alive() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+read_pid_file() {
+  local file="$1"
+  [[ -f "$file" ]] && tr -d '[:space:]' < "$file" || true
+}
+
+port_pids() {
+  local port="$1"
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | sort -u || true
+}
+
+port_is_listening() {
+  [[ -n "$(port_pids "$1")" ]]
+}
+
+http_ok() {
+  local url="$1"
+  curl -fsS --max-time 2 "$url" >/dev/null 2>&1
+}
+
+wait_for_url() {
+  local name="$1"
+  local url="$2"
+  local seconds="${3:-30}"
+  local start
+  start=$(date +%s)
+  while true; do
+    if http_ok "$url"; then
+      return 0
+    fi
+    if (( $(date +%s) - start >= seconds )); then
+      echo "Timed out waiting for $name at $url" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+cmd_for_pid() {
+  local pid="$1"
+  ps -p "$pid" -o command= 2>/dev/null || true
+}
+
+print_ports() {
+  cat <<PORTS
+Scryer reserved port range: ${SCRYER_RESERVED_PORT_START}-${SCRYER_RESERVED_PORT_END}
+
+  43210  PM backend
+  43211  Loom UI
+  43212  Scryer orchestrator (reserved)
+  43213  Tmuxer (reserved)
+  43214  Vault / secrets (reserved)
+  43215  Interaction service (reserved)
+  43216  STT / voice (reserved)
+  43217-43299  Future Scryer harness services only
+PORTS
+}
+
+known_port() {
+  local port="$1"
+  [[ "$port" == "$SCRYER_PM_PORT" || "$port" == "$SCRYER_LOOM_PORT" ]]
+}
+
+assert_reserved_ports_clean() {
+  local lines unknown=0 port pids pid cmd
+  lines=$(lsof -nP -iTCP:"${SCRYER_RESERVED_PORT_START}-${SCRYER_RESERVED_PORT_END}" -sTCP:LISTEN 2>/dev/null || true)
+  [[ -z "$lines" ]] && return 0
+
+  while read -r line; do
+    [[ "$line" == COMMAND* || -z "$line" ]] && continue
+    port=$(awk '{print $9}' <<<"$line" | sed -E 's/.*:([0-9]+)$/\1/')
+    [[ -z "$port" ]] && continue
+    if ! known_port "$port"; then
+      echo "Unknown process is listening on reserved Scryer port $port:" >&2
+      echo "  $line" >&2
+      unknown=1
+    fi
+  done <<< "$lines"
+
+  if [[ "$unknown" == "1" ]]; then
+    echo >&2
+    echo "Ports ${SCRYER_RESERVED_PORT_START}-${SCRYER_RESERVED_PORT_END} are reserved for Scryer only." >&2
+    exit 1
+  fi
+
+  for port in "$SCRYER_PM_PORT" "$SCRYER_LOOM_PORT"; do
+    pids=$(port_pids "$port")
+    [[ -z "$pids" ]] && continue
+    while read -r pid; do
+      [[ -z "$pid" ]] && continue
+      cmd=$(cmd_for_pid "$pid")
+      case "$port" in
+        "$SCRYER_PM_PORT")
+          if ! http_ok "$SCRYER_PM_URL/healthz"; then
+            echo "Port $port is occupied but PM health check failed. PID $pid: $cmd" >&2
+            exit 1
+          fi
+          ;;
+        "$SCRYER_LOOM_PORT")
+          if ! http_ok "$SCRYER_LOOM_URL"; then
+            echo "Port $port is occupied but Loom check failed. PID $pid: $cmd" >&2
+            exit 1
+          fi
+          ;;
+      esac
+    done <<< "$pids"
+  done
+}
+
+start_pm() {
+  if http_ok "$SCRYER_PM_URL/healthz"; then
+    echo "✓ PM backend already running at $SCRYER_PM_URL"
+    return 0
+  fi
+  if port_is_listening "$SCRYER_PM_PORT"; then
+    echo "Port $SCRYER_PM_PORT is occupied, but PM is not healthy at $SCRYER_PM_URL/healthz" >&2
+    return 1
+  fi
+  if [[ ! -d "$SCRYER_PM_APP_DIR" ]]; then
+    echo "PM app directory not found: $SCRYER_PM_APP_DIR" >&2
+    return 1
+  fi
+
+  echo "Starting PM backend on $SCRYER_PM_URL ..."
+  : > "$PM_LOG"
+  (
+    cd "$SCRYER_PM_APP_DIR"
+    if [[ -x ".venv/bin/python" ]]; then
+      exec .venv/bin/python -m uvicorn app.main:app --host "$SCRYER_PM_HOST" --port "$SCRYER_PM_PORT"
+    else
+      exec python3 -m uvicorn app.main:app --host "$SCRYER_PM_HOST" --port "$SCRYER_PM_PORT"
+    fi
+  ) >> "$PM_LOG" 2>&1 &
+  echo $! > "$PM_PID_FILE"
+  wait_for_url "PM backend" "$SCRYER_PM_URL/healthz" 45
+  echo "✓ PM backend running at $SCRYER_PM_URL"
+}
+
+start_loom() {
+  if http_ok "$SCRYER_LOOM_URL"; then
+    echo "✓ Loom already running at $SCRYER_LOOM_URL"
+    return 0
+  fi
+  if port_is_listening "$SCRYER_LOOM_PORT"; then
+    echo "Port $SCRYER_LOOM_PORT is occupied, but Loom is not reachable at $SCRYER_LOOM_URL" >&2
+    return 1
+  fi
+  if [[ ! -d "$SCRYER_LOOM_APP_DIR" ]]; then
+    echo "Loom app directory not found: $SCRYER_LOOM_APP_DIR" >&2
+    return 1
+  fi
+
+  echo "Starting Loom on $SCRYER_LOOM_URL ..."
+  : > "$LOOM_LOG"
+  (
+    cd "$SCRYER_LOOM_APP_DIR"
+    export VITE_API_URL="$SCRYER_PM_URL"
+    if ! command -v npm >/dev/null 2>&1; then
+      echo "npm not found. PATH=$PATH" >&2
+      exit 127
+    fi
+    exec npm run dev -- --host "$SCRYER_LOOM_HOST" --port "$SCRYER_LOOM_PORT"
+  ) >> "$LOOM_LOG" 2>&1 &
+  echo $! > "$LOOM_PID_FILE"
+  wait_for_url "Loom" "$SCRYER_LOOM_URL" 45
+  echo "✓ Loom running at $SCRYER_LOOM_URL"
+}
+
+open_loom_url() {
+  local browser="${1:-$SCRYER_BROWSER}"
+  case "$browser" in
+    chrome)
+      open -a "Google Chrome" "$SCRYER_LOOM_URL" >/dev/null 2>&1 || open "$SCRYER_LOOM_URL" >/dev/null 2>&1 || true
+      ;;
+    safari)
+      open -a Safari "$SCRYER_LOOM_URL" >/dev/null 2>&1 || open "$SCRYER_LOOM_URL" >/dev/null 2>&1 || true
+      ;;
+    cmux)
+      if command -v cmux >/dev/null 2>&1; then
+        cmux new-pane --type browser --url "$SCRYER_LOOM_URL" >/dev/null 2>&1 \
+          || cmux new-surface --type browser --url "$SCRYER_LOOM_URL" >/dev/null 2>&1 \
+          || open -a cmux "$SCRYER_LOOM_URL" >/dev/null 2>&1 \
+          || open "$SCRYER_LOOM_URL" >/dev/null 2>&1 \
+          || true
+      else
+        open "$SCRYER_LOOM_URL" >/dev/null 2>&1 || true
+      fi
+      ;;
+    default|system)
+      open "$SCRYER_LOOM_URL" >/dev/null 2>&1 || true
+      ;;
+    *)
+      echo "Unknown browser target: $browser" >&2
+      return 1
+      ;;
+  esac
+}
+
+cmd_up() {
+  local open_browser="$SCRYER_OPEN_BROWSER"
+  local browser="$SCRYER_BROWSER"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-open) open_browser=0 ;;
+      --chrome) browser=chrome ;;
+      --safari) browser=safari ;;
+      --cmux) browser=cmux ;;
+      --default|--system) browser=default ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "Unknown option for up: $1" >&2; usage; exit 1 ;;
+    esac
+    shift
+  done
+
+  echo "Starting Scryer local harness..."
+  assert_reserved_ports_clean
+  start_pm
+  start_loom
+
+  echo
+  echo "Scryer operator interface is ready."
+  echo "  PM backend: $SCRYER_PM_URL"
+  echo "  Loom UI:    $SCRYER_LOOM_URL"
+  echo
+  echo "Logs:"
+  echo "  PM:   $PM_LOG"
+  echo "  Loom: $LOOM_LOG"
+
+  if [[ "$open_browser" == "1" ]]; then
+    open_loom_url "$browser"
+  fi
+}
+
+stop_pid_file() {
+  local name="$1" file="$2"
+  local pid
+  pid=$(read_pid_file "$file")
+  if ! pid_alive "$pid"; then
+    rm -f "$file"
+    echo "- $name not running from harness pid file"
+    return 0
+  fi
+  echo "Stopping $name (PID $pid) ..."
+  kill "$pid" 2>/dev/null || true
+  for _ in {1..10}; do
+    pid_alive "$pid" || break
+    sleep 0.5
+  done
+  if pid_alive "$pid"; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$file"
+  echo "✓ $name stopped"
+}
+
+cmd_open() {
+  SCRYER_OPEN_BROWSER=1 cmd_up "$@"
+}
+
+cmd_down() {
+  stop_pid_file "Loom" "$LOOM_PID_FILE"
+  stop_pid_file "PM backend" "$PM_PID_FILE"
+}
+
+cmd_restart() {
+  cmd_down
+  cmd_up "$@"
+}
+
+short_cmd_for_pid() {
+  local pid="$1"
+  local cmd
+  [[ -z "$pid" || "$pid" == "—" ]] && { echo "—"; return; }
+  cmd=$(cmd_for_pid "$pid")
+  [[ -z "$cmd" ]] && { echo "—"; return; }
+  if [[ ${#cmd} -gt 54 ]]; then
+    echo "${cmd:0:51}..."
+  else
+    echo "$cmd"
+  fi
+}
+
+listener_pids_for_port() {
+  local port="$1"
+  local pids
+  pids=$(port_pids "$port" | paste -sd, - 2>/dev/null || true)
+  echo "${pids:-—}"
+}
+
+service_line() {
+  local name="$1" url="$2" pid_file="$3" health_url="${4:-$2}"
+  local pid health listener listener_first command port
+  pid=$(read_pid_file "$pid_file")
+  [[ -z "$pid" ]] && pid="—"
+  port="${url##*:}"
+  listener=$(listener_pids_for_port "$port")
+  listener_first="${listener%%,*}"
+
+  if http_ok "$health_url"; then
+    health="healthy"
+  elif [[ "$listener" != "—" ]]; then
+    health="unhealthy"
+  elif pid_alive "$pid"; then
+    health="starting"
+  else
+    health="stopped"
+  fi
+
+  if [[ "$listener_first" != "—" ]]; then
+    command=$(short_cmd_for_pid "$listener_first")
+  else
+    command=$(short_cmd_for_pid "$pid")
+  fi
+
+  printf "%-10s %-24s %-10s %-8s %-10s %s\n" "$name" "$url" "$health" "$pid" "$listener" "$command"
+}
+
+cmd_status() {
+  echo "Scryer local harness status"
+  echo
+  printf "%-10s %-24s %-10s %-8s %-10s %s\n" "SERVICE" "URL" "HEALTH" "PIDFILE" "LISTENER" "COMMAND"
+  service_line "PM" "$SCRYER_PM_URL" "$PM_PID_FILE" "$SCRYER_PM_URL/healthz"
+  service_line "Loom" "$SCRYER_LOOM_URL" "$LOOM_PID_FILE" "$SCRYER_LOOM_URL"
+  echo
+  echo "Reserved-port listeners:"
+  lsof -nP -iTCP:"${SCRYER_RESERVED_PORT_START}-${SCRYER_RESERVED_PORT_END}" -sTCP:LISTEN 2>/dev/null || echo "  none"
+}
+
+doctor_ok=0
+doctor_warn=0
+doctor_fail=0
+
+check_ok() {
+  printf "✓ %s\n" "$1"
+  doctor_ok=$((doctor_ok + 1))
+}
+
+check_warn() {
+  printf "! %s\n" "$1"
+  doctor_warn=$((doctor_warn + 1))
+}
+
+check_fail() {
+  printf "✗ %s\n" "$1"
+  doctor_fail=$((doctor_fail + 1))
+}
+
+cmd_doctor() {
+  echo "Scryer doctor"
+  echo
+
+  [[ -d "$SCRYER_ROOT" ]] && check_ok "Scryer root found: $SCRYER_ROOT" || check_fail "Scryer root missing: $SCRYER_ROOT"
+  [[ -f "$CONFIG_FILE" ]] && check_ok "Config found: $CONFIG_FILE" || check_fail "Config missing: $CONFIG_FILE"
+  [[ -x "$SCRIPT_DIR/scryer" ]] && check_ok "CLI executable is present" || check_fail "CLI executable is not executable"
+
+  local resolved
+  resolved=$(command -v scryer 2>/dev/null || true)
+  if [[ -n "$resolved" ]]; then
+    check_ok "scryer is on PATH: $resolved"
+  else
+    check_warn "scryer is not on PATH; run with $SCRIPT_DIR/scryer or add a symlink"
+  fi
+
+  [[ -d "$SCRYER_PM_APP_DIR" ]] && check_ok "PM app found: $SCRYER_PM_APP_DIR" || check_fail "PM app missing: $SCRYER_PM_APP_DIR"
+  [[ -f "$SCRYER_PM_APP_DIR/app/main.py" ]] && check_ok "PM FastAPI app found" || check_fail "PM FastAPI app missing"
+  if [[ -x "$SCRYER_PM_APP_DIR/.venv/bin/python" ]]; then
+    if (cd "$SCRYER_PM_APP_DIR" && .venv/bin/python -c 'import uvicorn, fastapi, sqlalchemy' >/dev/null 2>&1); then
+      check_ok "PM Python dependencies available in .venv"
+    else
+      check_fail "PM .venv exists but required Python dependencies are missing"
+    fi
+  elif command -v python3 >/dev/null 2>&1 && (cd "$SCRYER_PM_APP_DIR" && python3 -c 'import uvicorn, fastapi, sqlalchemy' >/dev/null 2>&1); then
+    check_ok "PM Python dependencies available via python3"
+  else
+    check_fail "PM Python runtime/dependencies unavailable"
+  fi
+
+  [[ -d "$SCRYER_LOOM_APP_DIR" ]] && check_ok "Loom app found: $SCRYER_LOOM_APP_DIR" || check_fail "Loom app missing: $SCRYER_LOOM_APP_DIR"
+  [[ -f "$SCRYER_LOOM_APP_DIR/package.json" ]] && check_ok "Loom package.json found" || check_fail "Loom package.json missing"
+  command -v npm >/dev/null 2>&1 && check_ok "npm available: $(command -v npm)" || check_fail "npm unavailable"
+  [[ -d "$SCRYER_LOOM_APP_DIR/node_modules" ]] && check_ok "Loom node_modules found" || check_warn "Loom node_modules missing; run npm install in $SCRYER_LOOM_APP_DIR"
+
+  local unknown=0 lines port
+  lines=$(lsof -nP -iTCP:"${SCRYER_RESERVED_PORT_START}-${SCRYER_RESERVED_PORT_END}" -sTCP:LISTEN 2>/dev/null || true)
+  if [[ -z "$lines" ]]; then
+    check_ok "Reserved port range ${SCRYER_RESERVED_PORT_START}-${SCRYER_RESERVED_PORT_END} is clean"
+  else
+    while read -r line; do
+      [[ "$line" == COMMAND* || -z "$line" ]] && continue
+      port=$(awk '{print $9}' <<<"$line" | sed -E 's/.*:([0-9]+)$/\1/')
+      if known_port "$port"; then
+        check_ok "Known Scryer port in use: $port"
+      else
+        check_fail "Unknown process on reserved Scryer port $port: $line"
+        unknown=1
+      fi
+    done <<< "$lines"
+    [[ "$unknown" == "0" ]] && check_ok "No unknown reserved-port listeners found"
+  fi
+
+  if http_ok "$SCRYER_PM_URL/healthz"; then
+    check_ok "PM backend healthy: $SCRYER_PM_URL"
+  elif port_is_listening "$SCRYER_PM_PORT"; then
+    check_fail "PM port $SCRYER_PM_PORT is occupied but health check failed"
+  else
+    check_ok "PM backend is stopped"
+  fi
+
+  if http_ok "$SCRYER_LOOM_URL"; then
+    check_ok "Loom healthy: $SCRYER_LOOM_URL"
+  elif port_is_listening "$SCRYER_LOOM_PORT"; then
+    check_fail "Loom port $SCRYER_LOOM_PORT is occupied but UI check failed"
+  else
+    check_ok "Loom is stopped"
+  fi
+
+  echo
+  echo "Doctor summary: $doctor_ok ok, $doctor_warn warning(s), $doctor_fail failure(s)"
+  [[ "$doctor_fail" == "0" ]]
+}
+
+collect_orphan_pids() {
+  local lines port pids pid
+  lines=$(lsof -nP -iTCP:"${SCRYER_RESERVED_PORT_START}-${SCRYER_RESERVED_PORT_END}" -sTCP:LISTEN 2>/dev/null || true)
+  [[ -z "$lines" ]] && return 0
+  while read -r line; do
+    [[ "$line" == COMMAND* || -z "$line" ]] && continue
+    port=$(awk '{print $9}' <<<"$line" | sed -E 's/.*:([0-9]+)$/\1/')
+    [[ -z "$port" ]] && continue
+    if ! known_port "$port"; then
+      pids=$(port_pids "$port")
+      while read -r pid; do
+        [[ -n "$pid" ]] && echo "$pid:$port"
+      done <<< "$pids"
+    fi
+  done <<< "$lines"
+}
+
+report_pid_file() {
+  local name="$1" file="$2" port="$3" health_url="$4"
+  local pid listeners
+  pid=$(read_pid_file "$file")
+  listeners=$(listener_pids_for_port "$port")
+  if [[ -z "$pid" ]]; then
+    echo "- $name pid file: missing"
+  elif pid_alive "$pid"; then
+    echo "- $name pid file: $pid alive"
+  else
+    echo "- $name pid file: $pid stale ($file)"
+  fi
+  echo "  listener(s) on $port: $listeners"
+  if http_ok "$health_url"; then
+    echo "  health: healthy"
+  elif [[ "$listeners" != "—" ]]; then
+    echo "  health: unhealthy listener present"
+  else
+    echo "  health: stopped"
+  fi
+}
+
+cmd_orphans() {
+  echo "Scryer orphan report"
+  echo
+  report_pid_file "PM" "$PM_PID_FILE" "$SCRYER_PM_PORT" "$SCRYER_PM_URL/healthz"
+  report_pid_file "Loom" "$LOOM_PID_FILE" "$SCRYER_LOOM_PORT" "$SCRYER_LOOM_URL"
+  echo
+  echo "Unexpected listeners in reserved range ${SCRYER_RESERVED_PORT_START}-${SCRYER_RESERVED_PORT_END}:"
+  local found=0 entry pid port
+  while read -r entry; do
+    [[ -z "$entry" ]] && continue
+    found=1
+    pid="${entry%%:*}"
+    port="${entry##*:}"
+    echo "- PID $pid on port $port: $(cmd_for_pid "$pid")"
+  done < <(collect_orphan_pids | sort -u)
+  [[ "$found" == "0" ]] && echo "  none"
+}
+
+cmd_kill_orphans() {
+  local assume_yes=0 entry pid port killed=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) assume_yes=1 ;;
+      -h|--help)
+        echo "Usage: scryer kill-orphans [--yes]"
+        echo "Kills unexpected listeners in reserved ports ${SCRYER_RESERVED_PORT_START}-${SCRYER_RESERVED_PORT_END} and removes stale pid files."
+        return 0
+        ;;
+      *) echo "Unknown option for kill-orphans: $1" >&2; return 1 ;;
+    esac
+    shift
+  done
+
+  cmd_orphans
+  echo
+  if [[ "$assume_yes" != "1" ]]; then
+    printf "Kill unexpected reserved-port listeners and clean stale pid files? [y/N] "
+    read -r reply
+    case "$reply" in
+      y|Y|yes|YES) ;;
+      *) echo "Aborted."; return 0 ;;
+    esac
+  fi
+
+  while read -r entry; do
+    [[ -z "$entry" ]] && continue
+    pid="${entry%%:*}"
+    port="${entry##*:}"
+    if pid_alive "$pid"; then
+      echo "Killing PID $pid on reserved port $port: $(cmd_for_pid "$pid")"
+      kill "$pid" 2>/dev/null || true
+      killed=$((killed + 1))
+    fi
+  done < <(collect_orphan_pids | sort -u)
+
+  for file in "$PM_PID_FILE" "$LOOM_PID_FILE"; do
+    pid=$(read_pid_file "$file")
+    if [[ -n "$pid" ]] && ! pid_alive "$pid"; then
+      echo "Removing stale pid file: $file ($pid)"
+      rm -f "$file"
+    fi
+  done
+
+  if [[ -f "$RUN_DIR/swiftbar-autostart.lock" ]]; then
+    pid=$(read_pid_file "$RUN_DIR/swiftbar-autostart.lock")
+    if [[ -z "$pid" ]] || ! pid_alive "$pid"; then
+      echo "Removing stale SwiftBar autostart lock"
+      rm -f "$RUN_DIR/swiftbar-autostart.lock"
+    fi
+  fi
+
+  echo "Done. Killed $killed unexpected listener(s)."
+}
+
+cmd_logs() {
+  local name="${1:-all}"
+  case "$name" in
+    pm) tail -f "$PM_LOG" ;;
+    loom) tail -f "$LOOM_LOG" ;;
+    all) tail -f "$PM_LOG" "$LOOM_LOG" ;;
+    *) echo "Unknown log name: $name (use pm, loom, all)" >&2; exit 1 ;;
+  esac
+}
+
+main() {
+  local command="${1:-}"
+  [[ $# -gt 0 ]] && shift || true
+  case "$command" in
+    up) cmd_up "$@" ;;
+    open) cmd_open "$@" ;;
+    restart) cmd_restart "$@" ;;
+    down) cmd_down "$@" ;;
+    status) cmd_status "$@" ;;
+    orphans) cmd_orphans "$@" ;;
+    kill-orphans) cmd_kill_orphans "$@" ;;
+    logs) cmd_logs "$@" ;;
+    ports) print_ports ;;
+    doctor) cmd_doctor "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) echo "Unknown command: $command" >&2; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
