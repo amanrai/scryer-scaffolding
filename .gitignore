@@ -1,3 +1,8 @@
 logs/*.log
 run/*.pid
 .DS_Store
+
+run/*
+!run/.gitkeep
+logs/*
+!logs/.gitkeep
