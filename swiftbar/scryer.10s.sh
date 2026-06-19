@@ -22,36 +22,40 @@ fi
 : "${SCRYER_PM_URL:=http://127.0.0.1:43210}"
 : "${SCRYER_LOOM_URL:=http://127.0.0.1:43211}"
 
-http_ok() {
+url_reachable() {
+  curl -sS --max-time 2 "$1" >/dev/null 2>&1
+}
+
+endpoint_ok() {
   curl -fsS --max-time 2 "$1" >/dev/null 2>&1
 }
 
-pm_status="stopped"
-pm_api_status="stopped"
-loom_status="stopped"
-loom_proxy_status="stopped"
+pm_status="not reachable"
+pm_api_status="not reachable"
+loom_status="not reachable"
+loom_proxy_status="not reachable"
 icon="○"
 color="gray"
 label="Scryer off"
 
-if http_ok "$SCRYER_PM_URL/healthz"; then
-  pm_status="healthy"
+if url_reachable "$SCRYER_PM_URL"; then
+  pm_status="reachable"
 fi
-if http_ok "$SCRYER_PM_URL/api/projects"; then
-  pm_api_status="healthy"
+if endpoint_ok "$SCRYER_PM_URL/api/projects"; then
+  pm_api_status="reachable"
 fi
-if http_ok "$SCRYER_LOOM_URL"; then
-  loom_status="healthy"
+if url_reachable "$SCRYER_LOOM_URL"; then
+  loom_status="reachable"
 fi
-if http_ok "$SCRYER_LOOM_URL/api/projects"; then
-  loom_proxy_status="healthy"
+if endpoint_ok "$SCRYER_LOOM_URL/api/projects"; then
+  loom_proxy_status="reachable"
 fi
 
-if [[ "$pm_status" == "healthy" && "$pm_api_status" == "healthy" && "$loom_status" == "healthy" && "$loom_proxy_status" == "healthy" ]]; then
+if [[ "$pm_status" == "reachable" && "$pm_api_status" == "reachable" && "$loom_status" == "reachable" && "$loom_proxy_status" == "reachable" ]]; then
   icon="●"
   color="#00d084"
   label="Scryer"
-elif [[ "$pm_status" == "healthy" || "$pm_api_status" == "healthy" || "$loom_status" == "healthy" || "$loom_proxy_status" == "healthy" ]]; then
+elif [[ "$pm_status" == "reachable" || "$pm_api_status" == "reachable" || "$loom_status" == "reachable" || "$loom_proxy_status" == "reachable" ]]; then
   icon="◐"
   color="orange"
   label="Scryer partial"
@@ -64,13 +68,12 @@ fi
 echo "$icon $label | color=$color"
 echo "---"
 echo "Open Loom | href=$SCRYER_LOOM_URL"
-echo "Open PM Health | href=$SCRYER_PM_URL/healthz"
 echo "Open PM Projects API | href=$SCRYER_PM_URL/api/projects"
 echo "---"
-echo "PM health: $pm_status"
-echo "PM API: $pm_api_status"
-echo "Loom: $loom_status"
-echo "Loom API proxy: $loom_proxy_status"
+echo "PM reachability: $pm_status"
+echo "PM API reachability: $pm_api_status"
+echo "Loom reachability: $loom_status"
+echo "Loom API proxy reachability: $loom_proxy_status"
 echo "---"
 echo "PM URL: $SCRYER_PM_URL | href=$SCRYER_PM_URL"
 echo "Loom URL: $SCRYER_LOOM_URL | href=$SCRYER_LOOM_URL"
